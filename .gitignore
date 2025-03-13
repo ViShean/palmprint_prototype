@@ -1,0 +1,10 @@
+/ROI_Extraction/Images
+/ROI_Extraction/ProcessedData/Annotations
+/ROI_Extraction/ProcessedData/ROI
+/ROI_Extraction/video
+identification/proper/data/backup/gallery_factorization_ori.pt
+identification/feature_matrix_A.npy
+__pycache__/
+*.py[cod]
+/ROI_Extraction_Jetson/darknet
+/ROI_Extraction/darknet

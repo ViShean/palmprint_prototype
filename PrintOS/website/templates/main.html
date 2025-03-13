@@ -1,0 +1,67 @@
+{% extends 'index.html' %}
+{% block title %}
+  Wavy Data Collection Prototype
+{% endblock %}
+{% block passthrough %}
+  <body class="text-light w-100">
+    <div class="container d-flex justify-content-around text-center w-100">
+      <div class="col-12 d-flex justify-content-between py-5">
+        <h3 class="highlight1"><img class="" style="width:15vh" src="{{ url_for('static', filename='/img/sit.svg') }}" /></h3>
+        <h3 class="highlight1"><img class="" style="width:5vh" src="{{ url_for('static', filename='/img/b.svg') }}" /></h3>
+        <h4 class="highlight1 highlight_date" id="date-time">{{date_time}}</h4>
+      </div>
+    </div>
+    <div class="container w-100">
+      <div class="row d-flex text-center">
+        <h1 class="mb-5 text-dark">Good Night, What would you like to do?</h1>
+      </div>
+      <div class="row d-flex justify-content-center">
+        <a href="#" class="col-4 box-bg rounded card_a">
+          <div class="w-100 h-100 position-relative">
+            <h1 class="m-0 position-absolute text-light" style="bottom: 35px; left: 25px;">Palm Print<br>Enrolment</h1>
+          </div>
+        </a>
+        <a href="#" class="col-4 box-bg rounded ms-5 card_b">
+          <div class="w-100 h-100 position-relative">
+            <h1 class="m-0 position-absolute text-light" style="bottom: 35px; left: 25px;">Palm Print<br>Identification</h1>
+          </div>
+        </a>
+      </div>
+      <div class="row mt-5">
+        <div class="btn mt-1 btn-danger btn-sm rounded-pill d-flex justify-content-center align-items-center">
+          <i class="bi bi-arrow-left-short" style="font-size: 2vw;"></i>
+          <h5 class="m-0">Back</h5>
+        </div>
+      </div>
+    </div>
+  </body>
+
+  <script>
+    function updateDateTime() {
+      const now = new Date();
+      
+      // Extract date components
+      const month = now.toLocaleString('en-US', { month: 'short' }); // Jan
+      const day = now.toLocaleString('en-US', { day: 'numeric' }); // 26
+      const weekday = now.toLocaleString('en-US', { weekday: 'short' }); // Sun
+      const time = now.toLocaleString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }); // 11:20 AM
+  
+      // Construct the desired format: Jan 26 (Sun), 11:20 AM
+      const formattedDateTime = `${month} ${day} (${weekday})  |  ${time}`;
+  
+      // Update the DOM
+      document.getElementById('date-time').textContent = formattedDateTime;
+  }
+  
+  // Update the date and time every second
+  setInterval(updateDateTime, 1000);
+  
+  // Initialize on page load
+  window.onload = updateDateTime;
+
+  </script>
+{% endblock %}
+
+{% block detail_loops %}
+
+{% endblock %}

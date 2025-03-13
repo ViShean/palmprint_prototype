@@ -1,0 +1,242 @@
+{% extends 'index.html' %}
+{% block title %}
+User Data Collection - PalmPrint Autentication Prototype 
+{% endblock %}
+{% block passthrough %}
+  <body class="text-light w-100">
+    <div class="container d-flex justify-content-around text-center w-100">
+      <div class="col-12 d-flex justify-content-between py-5">
+        <h3 class="highlight1"><img class="" style="width:15vh" src="{{ url_for('static', filename='/img/sit.svg') }}" /></h3>
+        <h3 class="highlight1"><img class="" style="width:5vh" src="{{ url_for('static', filename='/img/b.svg') }}" /></h3>
+        <h4 class="highlight1 highlight_date" id="date-time">{{date_time}}</h4>
+      </div>
+    </div>
+    <div class="container w-100">
+      <div class="row d-flex text-center">
+        <h1 class="mb-5 text-dark">PalmPrint Data Collection</h1>
+      </div>
+
+      <div class="row d-flex justify-content-center">
+        <!-- Instructions for users before starting the palm print data collection process -->
+        <div class="box-bg rounded card_c flex-column justify-content-between align-items-center d-flex" id="instructions_div">
+              <h3 class="py-3 text-danger m-0">Here’s what you need to know before getting started</h3>
+              <div class="card-group">
+                <div class="card">
+                  <img src="{{ url_for('static', filename='/img/n1.png') }}" class="card-img-top" alt="...">
+                  <div class="card-body">
+                    <h5 class="card-title">Place your hand under the sensor</h5>
+                    <p class="card-text"><i class="bi bi-hand-index-thumb me-2"></i> Ensure your hand is in position under the sensor for proper detection.</p>
+                  </div>
+                </div>
+                <div class="card">
+                  <img src="{{ url_for('static', filename='/img/n2.png') }}" class="card-img-top" alt="...">
+                  <div class="card-body">
+                    <h5 class="card-title">Limit hand movement for accurate results</h5>
+                    <p class="card-text"><i class="bi bi-hand-thumbs-up me-2"></i> Try to avoid unnecessary motion during the process for the best results.</p>
+                  </div>
+                </div>
+                <div class="card">
+                  <img src="{{ url_for('static', filename='/img/n3.png') }}" class="card-img-top" alt="...">
+                  <div class="card-body">
+                    <h5 class="card-title">Once completed, remove your hand</h5>
+                    <p class="card-text"><i class="bi bi-check-circle me-2"></i> After the process is finished, move your hand away from the sensor.</p>
+                  </div>
+                </div>
+              </div>
+              <div class="row mt-3 w-75">
+                <div class="btn btn-secondary btn-sm rounded-pill d-flex justify-content-center align-items-center" id="startButton">
+                  <i class="bi bi-arrow-right-short" style="font-size: 2vw;"></i>
+                  <h5 class="m-0">Start</h5>
+                </div>
+              </div>
+        </div>
+      <!-- Actual Preview of palm print data collection process -->
+        <div class="box-bg rounded card_c flex-column justify-content-between align-items-center d-none" id="capture_div">
+          <div class="text-danger d-block text-center" id="terminal-output"></div>
+          <div class="text-success d-none" id="success-txt">Image Capture Success!</div>
+          <img id="videoFeed" src="{{ url_for('views.video_feed') }}" width="65%" />
+        </div>
+    </div>
+
+       <div class="row mt-5">
+        <!--This is a CTA to return back home page ah-->
+        <a href="/" class="text-decoration-none p-0 m-0">
+          <div class="btn mt-5 btn-danger btn-sm rounded-pill d-flex justify-content-center align-items-center">
+            <i class="bi bi-arrow-left-short" style="font-size: 2vw;"></i>
+            <h5 class="m-0">Back</h5>
+          </div>
+        </a>
+      </div>
+
+    </div>
+  </body>
+
+<script>
+  document.getElementById('startButton').onclick = function() {
+    // Add the d-none class to hide instructions div
+    document.getElementById('instructions_div').classList.add('d-none');
+
+    // Remove the d-none class (if it was already present) and add d-flex to display capture div
+    document.getElementById('capture_div').classList.remove('d-none');
+    document.getElementById('capture_div').classList.add('d-flex');
+
+    // Send a POST request to start the camera
+    fetch('/start_camera', {
+        method: 'POST'
+    })
+    .then(response => {
+        if (response.ok) {
+            console.log("Camera started");
+            // Update the src of the video feed to start streaming
+            document.getElementById('videoFeed').src = "{{ url_for('views.video_feed') }}";
+
+            // Call the capture_images route after the camera starts
+            fetch('/capture_images', {
+                method: 'POST'
+            })
+            .then(response => {
+                if (response.ok) {
+                    console.log("Image capture started");
+                } else {
+                    console.error("Failed to start image capture:", response.statusText);
+                }
+            })
+            .catch(err => console.error("Error starting image capture:", err));
+        } else {
+            console.error("Failed to start camera:", response.statusText);
+        }
+    })
+    .catch(err => console.error("Error starting camera:", err));
+};
+
+const terminalOutputDiv = document.getElementById('terminal-output');
+
+// Create an EventSource to listen for updates
+const eventSource = new EventSource('/stream_terminal_output');
+
+// Append new output to the div
+eventSource.onmessage = function(event) {
+    terminalOutputDiv.textContent += event.data + '\n';
+    terminalOutputDiv.scrollTop = terminalOutputDiv.scrollHeight;  // Auto-scroll
+};
+
+// Handle errors
+eventSource.onerror = function(err) {
+    console.error("EventSource failed:", err);
+    eventSource.close();
+};
+
+function fetchTerminalOutput() {
+    fetch('/get_terminal_output')
+        .then(response => {
+            if (!response.ok) {
+                throw new Error("Network response was not ok");
+            }
+            return response.json();
+        })
+        .then(data => {
+            const outputDiv = document.getElementById('terminal-output');
+            const isScrolledToBottom = outputDiv.scrollHeight - outputDiv.clientHeight <= outputDiv.scrollTop + 1;
+
+            // Update the content
+            outputDiv.textContent = data.join('\n');
+
+            // Auto-scroll to the bottom if already scrolled down
+            if (isScrolledToBottom) {
+                outputDiv.scrollTop = outputDiv.scrollHeight;
+            }
+        })
+        .catch(err => console.error("Error fetching terminal output:", err));
+}
+
+// Fetch terminal output every 2 seconds
+setInterval(fetchTerminalOutput, 500);
+
+</script>
+
+<script>
+  function updateDateTime() {
+      const now = new Date();
+      
+      // Extract date components
+      const month = now.toLocaleString('en-US', { month: 'short' }); // Jan
+      const day = now.toLocaleString('en-US', { day: 'numeric' }); // 26
+      const weekday = now.toLocaleString('en-US', { weekday: 'short' }); // Sun
+      const time = now.toLocaleString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }); // 11:20 AM
+      
+      // Determine greeting based on time of day
+      const hour = now.getHours();
+      let greeting = 'Good Night'; // Default
+      if (hour >= 5 && hour < 12) {
+          greeting = 'Good Morning';
+      } else if (hour >= 12 && hour < 17) {
+          greeting = 'Good Afternoon';
+      } else if (hour >= 17 && hour < 21) {
+          greeting = 'Good Evening';
+      }
+
+      // Construct the desired format: Jan 26 (Sun), 11:20 AM
+      const formattedDateTime = `${month} ${day} (${weekday})  |  ${time}`;
+      
+      // Update the DOM
+      document.getElementById('date-time').textContent = formattedDateTime;
+      document.getElementById('greeting').textContent = greeting;
+  }
+
+  // Update the date and time every second
+  setInterval(updateDateTime, 1000);
+  
+  // Initialize on page load
+  window.onload = updateDateTime;
+</script>
+    
+<script>
+    function fetchTerminalOutput() {
+      fetch('/get_terminal_output')
+          .then(response => {
+              if (!response.ok) {
+                  throw new Error("Network response was not ok");
+              }
+              return response.json();
+          })
+          .then(data => {
+              const outputDiv = document.getElementById('terminal-output');
+              const successTxtDiv = document.getElementById('success-txt');
+              const isScrolledToBottom = outputDiv.scrollHeight - outputDiv.clientHeight <= outputDiv.scrollTop + 1;
+  
+              // Update the content
+              outputDiv.textContent = data.join('\n');
+  
+              // Auto-scroll to the bottom if already scrolled down
+              if (isScrolledToBottom) {
+                  outputDiv.scrollTop = outputDiv.scrollHeight;
+              }
+  
+              // Check if the log contains "Camera released."
+              if (data.some(line => line.includes("Camera released."))) {
+                  // Hide terminal output and show success message
+                  outputDiv.classList.add("d-none");  // Hide terminal output
+                  successTxtDiv.classList.remove("d-none");  // Show success message
+                  successTxtDiv.classList.add("d-block");
+                  console.log("Camera released, showing success.");
+              } else {
+                  // Keep terminal output visible and hide success message
+                  outputDiv.classList.remove("d-none");  // Show terminal output
+                  outputDiv.classList.add("d-block");
+                  successTxtDiv.classList.add("d-none");  // Hide success message
+                  successTxtDiv.classList.remove("d-block");
+                  console.log("Keep fetching terminal output.");
+              }
+          })
+          .catch(err => console.error("Error fetching terminal output:", err));
+  }
+  
+  // Fetch terminal output every 1 second (adjust interval as needed)
+  setInterval(fetchTerminalOutput, 500);
+
+</script>
+{% endblock %}
+
+{% block detail_loops %}
+
+{% endblock %}

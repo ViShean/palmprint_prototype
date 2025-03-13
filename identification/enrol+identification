@@ -1,0 +1,202 @@
+import os
+import numpy as np
+import torch
+import torchvision.transforms as T
+from PIL import Image
+import json
+
+# -------------------- Load Existing Data -------------------- #
+feature_matrix_path = "feature_matrix_s14_no_interpolate.npy"
+class_dict_path = "feature_matrix_s14_no_interpolate.json"  # Assuming you have stored class info separately
+new_matrix_path="test.npy"
+
+if os.path.exists(new_matrix_path):
+    A = np.load(new_matrix_path)
+    print("Loaded feature matrix with shape: {}".format(A.shape))
+elif os.path.exists(feature_matrix_path):
+    A = np.load(feature_matrix_path)
+    print("Loaded feature matrix with shape: {}".format(A.shape))
+else:
+    A = np.empty((384, 0))
+    np.save(feature_matrix_path, A)
+
+if os.path.exists(class_dict_path):
+    with open(class_dict_path, 'r') as f:
+        class_dict = json.load(f)
+else:
+    class_dict = {}
+
+# -------------------- Mode Selection -------------------- #
+mode = input("Enter mode (enroll / identify): ").strip().lower()
+if mode not in ["enroll", "identify"]:
+    print("Invalid mode selected. Please enter 'enroll' or 'identify'.")
+    exit(1)
+
+# -------------------- DINOv2 Model Setup -------------------- #
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == "cuda":
+    # Optionally clear cache before inference
+    torch.cuda.empty_cache()
+print("Loading DINOv2 model for {}...".format(mode))
+model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+model.eval()
+
+model.to(device)
+# Only use half precision if using GPU
+if device.type == "cuda":
+    model.half()
+print("DINOv2 model loaded on device: {}".format(device))
+
+# Define image transformation pipeline
+transform = T.Compose([
+    T.Resize(256),
+    T.CenterCrop(224),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]),
+])
+
+# -------------------- Utility Functions -------------------- #
+def normalize_vector(vector):
+    """Normalize a vector to unit norm."""
+    norm = np.linalg.norm(vector)
+    return vector / norm if norm != 0 else vector
+
+def extract_features(image_path):
+    """Extract a feature vector from an image using DINOv2."""
+    try:
+        pil_img = Image.open(image_path).convert("L")
+        # Convert grayscale to 3-channel RGB
+        pil_img = Image.merge("RGB", (pil_img, pil_img, pil_img))
+    except Exception as e:
+        print("Error loading image {}: {}".format(image_path, e))
+        return None
+
+    img_tensor = transform(pil_img).unsqueeze(0).to(device)
+    # Only convert to half precision if using GPU
+    if device.type == "cuda":
+        img_tensor = img_tensor.half()
+    
+    with torch.no_grad():
+        features = model(img_tensor)
+    features = features.cpu().numpy().flatten()
+    return normalize_vector(features)
+
+def identify(y, A, class_dict, lambda_=0.001):
+    # Convert the gallery matrix and probe vector to GPU tensors
+    A_torch = torch.tensor(A, dtype=torch.float32, device=device)
+    y_torch = torch.tensor(y, dtype=torch.float32, device=device)
+    
+    # Compute A^T A and A^T y on GPU
+    At = A_torch.t()
+    AtA = torch.matmul(At, A_torch)
+    Aty = torch.matmul(At, y_torch).unsqueeze(1)  # Make Aty a 2D column vector
+    
+    n = A_torch.shape[1]
+    I = torch.eye(n, device=device, dtype=torch.float32)
+    regularized_matrix = AtA + lambda_ * I
+
+    try:
+        # Use Cholesky decomposition to solve the system on GPU
+        L = torch.linalg.cholesky(regularized_matrix)
+        x0 = torch.cholesky_solve(Aty, L)  # x0 is 2D
+        x0 = x0.squeeze(1)                # Convert back to 1D: shape (n,)
+    except RuntimeError as e:
+        print("Error during linear solve:", e)
+        return None
+
+    best_class = None
+    min_error = float('inf')
+    
+    # Iterate over each class and compute the reconstruction error on GPU
+    for cls, indices in class_dict.items():
+        # Convert indices list to a GPU tensor of type long
+        indices_tensor = torch.tensor(indices, device=device, dtype=torch.long)
+        
+        # Extract the corresponding columns from A_torch and elements from x0
+        A_class = A_torch[:, indices_tensor]  # shape: (feature_dim, num_class_samples)
+        x0_class = x0[indices_tensor]          # shape: (num_class_samples,)
+        
+        # Compute reconstruction: matrix multiplication A_class * x0_class
+        # We unsqueeze x0_class to perform proper matrix multiplication and then squeeze
+        reconstruction = torch.matmul(A_class, x0_class.unsqueeze(1)).squeeze(1)  # shape: (feature_dim,)
+        
+        # Compute the squared L2 error between y_torch and the reconstruction
+        error = torch.norm(y_torch - reconstruction, p=2) ** 2
+        
+        if error.item() < min_error:
+            min_error = error.item()
+            best_class = cls
+
+    return best_class
+
+
+
+
+# -------------------- Main Branches -------------------- #
+if mode == "enroll":
+    # Enrollment branch: Compute features for new participant images and update gallery.
+    new_participant_id = input("Enter new participant ID: ").strip()
+    new_images_input = input("Enter enrollment image paths (comma-separated): ").strip()
+    new_images = [path.strip() for path in new_images_input.split(",") if path.strip()]
+    
+    if len(new_images) == 0:
+        print("No enrollment image paths provided. Exiting.")
+        exit(1)
+    
+    new_features_list = []
+    for img_path in new_images:
+        feature_vector = extract_features(img_path)
+        if feature_vector is not None:
+            new_features_list.append(feature_vector)
+    
+    if len(new_features_list) == 0:
+        print("No valid images found for new participant. Exiting.")
+        exit(1)
+    
+    new_features = np.array(new_features_list)  # shape: (num_images, feature_dim)
+    print("New enrollment features shape: {}".format(new_features.shape))
+    
+    # Verify that feature dimensions match
+    if new_features.shape[1] != A.shape[0]:
+        print("Feature dimension mismatch: enrollment features have dimension {} but gallery features have dimension {}. Exiting."
+              .format(new_features.shape[1], A.shape[0]))
+        exit(1)
+    
+    # Append new features to gallery (transpose new_features so that each column is a feature vector)
+    new_features = new_features.T  # shape: (feature_dim, num_images)
+    print("Original feature matrix shape: {}".format(A.shape))
+    A_expanded = np.hstack((A, new_features))
+    np.save(new_matrix_path, A_expanded)
+    print("Updated feature matrix shape: {}".format(A_expanded.shape))
+    
+    # Update class dictionary with new indices (columns correspond to images)
+    start_index = A.shape[1]
+    new_indices = list(range(start_index, start_index + new_features.shape[1]))
+    class_dict[new_participant_id] = new_indices
+    
+    # Save updated class dictionary
+    with open(class_dict_path, 'w') as f:
+        json.dump(class_dict, f, indent=4)
+    
+    print("New participant {} enrolled successfully!".format(new_participant_id))
+
+elif mode == "identify":
+    # Identification branch: Identify a participant from test images.
+    test_images_input = input("Enter test image paths (comma-separated): ").strip()
+    test_images = [path.strip() for path in test_images_input.split(",") if path.strip()]
+    
+    if len(test_images) == 0:
+        print("No test image paths provided. Exiting.")
+        exit(1)
+    
+    gallery = A  # Use the current feature matrix (expanded if enrollment has been done)
+    
+    for img_path in test_images:
+        feature_vector = extract_features(img_path)
+        if feature_vector is None:
+            print("Skipping image {} due to extraction error.".format(img_path))
+            continue
+        
+        predicted_class = identify(feature_vector, gallery, class_dict, lambda_=0.001)
+        print("Identified participant for {}: {}".format(os.path.basename(img_path), predicted_class))
