@@ -158,8 +158,10 @@ folder_name = os.path.basename(input_dir)
 # Create output directory structure based on the folder name
 roi_dir = os.path.join(output_root, "ROI", folder_name)
 annotation_dir = os.path.join(output_root, "Annotations", folder_name)
-os.makedirs(roi_dir, exist_ok=True)
-os.makedirs(annotation_dir, exist_ok=True)
+if not os.path.exists(roi_dir):
+    os.makedirs(roi_dir)
+if not os.path.exists(annotation_dir):
+    os.makedirs(annotation_dir)
 
 # Darknet parameters (update these paths as needed)
 darknet_dir = os.path.join(os.getcwd(), "darknet")

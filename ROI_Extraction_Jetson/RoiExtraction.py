@@ -39,7 +39,9 @@ def run_darknet_detection(
     Returns:
     - list of dicts: Filtered detections with exactly four distinct, non-overlapping boxes
     """
-    os.makedirs(output_dir, exist_ok=True)
+    if not os.path.exists(output_dir):
+
+        os.makedirs(output_dir)
     # darknet_exe = os.path.join(darknet_dir, "darknet.exe")
     
     if os.name == 'nt':  # Windows

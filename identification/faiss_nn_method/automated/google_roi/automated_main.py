@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 Jetson listener for NFS-triggered palm-print pipeline
-Python 3.6-compatible version
+Python 3.6-compatible
 """
-
 import os, re, json, time, pathlib, queue, threading, logging, collections
+from typing import Tuple, Dict, List
+
 import numpy as np
+import cv2
 from PIL import Image
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import torch, torchvision.transforms as T
+
+import torch
+import torchvision.transforms as T
 
 # ────────── paths & constants ──────────────────────────────────────────
-IN_DIR   = pathlib.Path("/srv/cam/in")
-OUT_DIR  = pathlib.Path("/srv/cam/out")
+IN_DIR   = pathlib.Path("/mnt/jetson_cam/in")
+OUT_DIR  = pathlib.Path("/mnt/jetson_cam/out")
 DATA_DIR = pathlib.Path("data")
-ROI_DIR = pathlib.Path("/srv/cam/roi")   # <— choose any folder you like
+ROI_DIR  = pathlib.Path("/mnt/jetson_cam/roi")
 ROI_DIR.mkdir(parents=True, exist_ok=True)
 
 FEATURE_NPY = DATA_DIR / "feature_matrix_s14_no_interpolate.npy"
@@ -35,23 +39,24 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",
                     datefmt="%H:%M:%S")
 
-logging.info("Loading DINOv2 model …")
-model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+logging.info("Loading DINOv2 ViT-S/14 …")
+model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
+                       pretrained=True)
 model.eval().to(device)
 if device.type == "cuda":
     model.half()
 
 transform = T.Compose([
     T.Resize(256), T.CenterCrop(224), T.ToTensor(),
-    T.Normalize([0.485, 0.456, 0.406],
-                [0.229, 0.224, 0.225])
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225])
 ])
 
 @torch.no_grad()
 def extract_features(img_path: str) -> np.ndarray:
-    """Return L2-normalised 384-D feature vector for one image path."""
-    pil = Image.open(img_path).convert("L")
-    pil = Image.merge("RGB", (pil, pil, pil))
+    """Return L2-normalised 384-D feature vector for one image."""
+    pil = Image.open(img_path).convert("L")        # grayscale
+    pil = Image.merge("RGB", (pil, pil, pil))      # fake 3-ch
     ten = transform(pil).unsqueeze(0).to(device)
     if device.type == "cuda":
         ten = ten.half()
@@ -59,8 +64,8 @@ def extract_features(img_path: str) -> np.ndarray:
     vec /= np.linalg.norm(vec)
     return vec.astype(np.float32)
 
-# ────────── gallery I/O ───────────────────────────────────────────────
-def load_gallery():
+# ────────── gallery I/O ────────────────────────────────────────────────
+def load_gallery() -> Tuple[np.ndarray, Dict[str, int]]:
     if NEW_MATRIX.exists():
         A = np.load(NEW_MATRIX)
     elif FEATURE_NPY.exists():
@@ -70,7 +75,7 @@ def load_gallery():
     classes = json.load(CLASS_JSON.open()) if CLASS_JSON.exists() else {}
     return A, classes
 
-def save_gallery(A, classes):
+def save_gallery(A: np.ndarray, classes: Dict[str, int]) -> None:
     np.save(NEW_MATRIX, A)
     with CLASS_JSON.open("w") as f:
         json.dump(classes, f, indent=2)
@@ -78,20 +83,27 @@ def save_gallery(A, classes):
 A, class_dict = load_gallery()
 logging.info("Gallery columns (subjects): %d", A.shape[1])
 
-# ────────── import original helpers ───────────────────────────────────
-from enroll   import run_enrollment
+# ────────── import original helpers ────────────────────────────────────
+from enroll   import run_enrollment   # expected to return (A, class_dict)
 from identify import run_identification
-# expected signatures:
-#   A, class_dict = run_enrollment(A, class_dict, NEW_MATRIX, extract_features, img_path)
-#   label         = run_identification(A, class_dict, extract_features, img_path)
 
-# ────────── session buffers ──────────────────────────────────────────
-enr_count = collections.Counter()           # {sid: processed_count}
-enr_label = {}                              # {sid: label_assigned}
-id_votes  = collections.defaultdict(list)   # {sid: [label, …]}
+# ────────── helper: warm-up DINOv2 once ────────────────────────────────
+def warm_dinov2() -> None:
+    with torch.no_grad():
+        dummy = torch.zeros((1, 3, 224, 224), device=device)
+        if device.type == "cuda":
+            dummy = dummy.half()
+        _ = model(dummy)
 
-# ────────── helper to write JSON results ─────────────────────────────
-def write_json(stem, payload):
+warm_dinov2()
+
+# ────────── session state ──────────────────────────────────────────────
+enr_count: collections.Counter = collections.Counter()  # {sid: processed}
+enr_label: Dict[str, str]       = {}                    # {sid: label}
+id_votes : Dict[str, List[str]] = collections.defaultdict(list)
+
+# ────────── helper to write JSON results ───────────────────────────────
+def write_json(stem: str, payload: dict) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     tmp   = OUT_DIR / (stem + ".tmp")
     final = OUT_DIR / (stem + ".ok.json")
@@ -99,41 +111,67 @@ def write_json(stem, payload):
         json.dump(payload, f, indent=2)
     tmp.rename(final)
 
-# ────────── watchdog setup ───────────────────────────────────────────
-work_q = queue.Queue(maxsize=256)           # 3.6-friendly (no annotation)
+# ────────── directory monitor (watchdog) ───────────────────────────────
+work_q: queue.Queue = queue.Queue(maxsize=256)
 
 class NewFile(FileSystemEventHandler):
-    """Enqueue every .jpg that gets atomically moved into IN_DIR."""
+    """Enqueue every .jpg that appears via atomic rename in IN_DIR."""
     def on_moved(self, event):
+        # event.dest_path is the *new* name after rename
         if not event.is_directory and event.dest_path.endswith(".jpg"):
             work_q.put(pathlib.Path(event.dest_path))
     def on_created(self, event):
-        if not event.is_directory and event.src_path.endswith(".jpg"):
+        # created events will fire if the producer writes directly,
+        # but we still only accept ready-made .jpg
+        if (not event.is_directory
+                and event.src_path.endswith(".jpg")):
             work_q.put(pathlib.Path(event.src_path))
-# ----------  ROI extraction with Darknet  (Py-3.6 friendly)  ----------
-import cv2
-import typing
-from google_roi import extract_palm_roi
 
-def roi_from_image(img_path):
+# ────────── ROI extraction helper ──────────────────────────────────────
+from google_roi import extract_palm_roi    # your landmark/ROI function
+
+def wait_for_stable(path: pathlib.Path, retries: int = 20,
+                    pause: float = 0.05) -> bool:
+    """Return True when file size has stopped changing."""
+    prev = -1
+    for _ in range(retries):
+        try:
+            size = path.stat().st_size
+            if size == prev and size > 0:
+                return True
+            prev = size
+        except FileNotFoundError:
+            pass
+        time.sleep(pause)
+    return False
+
+def roi_from_image(img_path: pathlib.Path):
+    # ensure file is fully written (if direct write, not rename)
+    wait_for_stable(img_path, retries=10, pause=0.1)
+
     img = cv2.imread(str(img_path))
     if img is None:
-        logging.error("OpenCV failed to read %s", img_path)
+        logging.error("OpenCV failed to read %s", img_path.name)
         return None
+
     roi, _, _ = extract_palm_roi(img)
     if roi is None:
         logging.warning("Landmarks not found in %s", img_path.name)
         return None
+
     roi_path = ROI_DIR / (img_path.stem + "_roi.jpg")
     cv2.imwrite(str(roi_path), roi)
     return roi_path
 
-
-# ────────── worker thread ────────────────────────────────────────────
+# ────────── worker thread ──────────────────────────────────────────────
 def process_loop():
     global A, class_dict
     while True:
-        p = work_q.get()
+        p: pathlib.Path = work_q.get()
+        # ignore any stray .tmp or unrelated file
+        if p.suffix != ".jpg":
+            continue
+
         m = FNAME_RE.match(p.name)
         if not m:
             logging.warning("Ignoring bad filename %s", p.name)
@@ -144,58 +182,59 @@ def process_loop():
         mode, sid, idx = m.group(1).upper(), m.group(2), m.group(3)
 
         try:
+            roi_path = roi_from_image(p)
+            if roi_path is None:
+                continue
+
             if mode == "ENR":
-                roi_path = roi_from_image(p)
-                if roi_path is None:
-                    continue         # skip this frame, do not count toward batch
                 A, class_dict = run_enrollment(
                     A, class_dict, NEW_MATRIX, extract_features, str(roi_path)
                 )
-                # remember the label returned on first image
                 if sid not in enr_label:
+                    # assign label for this new subject
                     enr_label[sid] = max(class_dict, key=class_dict.get)
                 enr_count[sid] += 1
 
                 if enr_count[sid] == BATCH:
                     save_gallery(A, class_dict)
-                    write_json("ENR_" + sid, {
-                        "mode": "enroll",
+                    write_json(f"ENR_{sid}", {
+                        "mode":    "enroll",
                         "session": sid,
-                        "label": enr_label[sid],
-                        "images": BATCH
+                        "label":   enr_label[sid],
+                        "images":  BATCH
                     })
                     enr_count.pop(sid, None)
                     enr_label.pop(sid, None)
 
             else:  # IDENTIFY
-                roi_path = roi_from_image(p)
-                if roi_path is None:
-                    continue
                 label = run_identification(
                     A, class_dict, extract_features, str(roi_path)
                 )
                 if label:
                     id_votes[sid].append(label)
+
                 if len(id_votes[sid]) == BATCH:
                     votes   = collections.Counter(id_votes.pop(sid))
-                    max_cnt = votes.most_common(1)[0][1]
-                    winners = [lbl for lbl, c in votes.items() if c == max_cnt]
-                    final   = winners[0]   # simple tie-break rule
-                    write_json("ID_" + sid, {
-                        "mode": "identify",
+                    top_cnt = votes.most_common(1)[0][1]
+                    winners = [lbl for lbl, c in votes.items() if c == top_cnt]
+                    final   = winners[0]  # tie-break: first winner
+                    write_json(f"ID_{sid}", {
+                        "mode":    "identify",
                         "session": sid,
-                        "votes": dict(votes),
-                        "winner": final,
-                        "count": max_cnt
+                        "votes":   dict(votes),
+                        "winner":  final,
+                        "count":   top_cnt
                     })
-                    print(f"[✓] Final result for session {sid} written as {final}")
+                    logging.info("[✓] Final result for session %s → %s",
+                                 sid, final)
 
         finally:
+            # clean up original file if still present
             try: p.unlink()
             except FileNotFoundError:
                 pass
 
-# ────────── main entry ───────────────────────────────────────────────
+# ────────── main ───────────────────────────────────────────────────────
 def main():
     IN_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -203,14 +242,6 @@ def main():
     observer = Observer()
     observer.schedule(NewFile(), str(IN_DIR), recursive=False)
     observer.start()
-    # Dummy call to Warm up the transform + model before first real use as the first image is always slower
-    with torch.no_grad():
-        dummy_image = Image.new("L", (256, 256))  # dummy grayscale image
-        dummy_rgb = Image.merge("RGB", (dummy_image, dummy_image, dummy_image))
-        dummy_tensor = transform(dummy_rgb).unsqueeze(0).to(device)
-        if device.type == "cuda":
-            dummy_tensor = dummy_tensor.half()
-        _ = model(dummy_tensor)
 
     threading.Thread(target=process_loop, daemon=True).start()
     logging.info("Watching %s  (batch size %d)… Ctrl-C to stop",
