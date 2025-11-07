@@ -1,0 +1,49 @@
+### 🧩 Running from Desktop (Ubuntu)
+
+If you want to launch the Palmprint Authenticator easily from your desktop:
+
+#### **1️⃣ Make the script executable**
+
+```bash
+chmod +x /home/nemo/Documents/palmprint-authenticator/run_automated_main.sh
+```
+
+This ensures the launcher script has permission to run.
+
+---
+
+#### **2️⃣ Create the `.desktop` shortcut**
+
+Create a new file in your Desktop folder:
+
+```bash
+nano ~/Desktop/palmprint-authenticator.desktop
+```
+
+Paste the following content:
+
+```ini
+[Desktop Entry]
+Name=Palmprint Authenticator
+Comment=Run automated palmprint authenticator
+Exec=/home/nemo/Documents/palmprint-authenticator/run_automated_main.sh
+Icon=utilities-terminal
+Terminal=true
+Type=Application
+Categories=Utility;
+```
+
+Save and exit (`Ctrl + O`, `Enter`, `Ctrl + X`).
+
+Then make the desktop file executable:
+
+```bash
+chmod +x ~/Desktop/palmprint-authenticator.desktop
+```
+
+If Ubuntu shows “Untrusted Launcher,” right-click the icon and select **Allow Launching**.
+
+---
+
+After that, you can simply **double-click the desktop icon** to open a terminal, automatically activate the virtual environment, and run  
+`automated_main.py`.

@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Jetson listener for NFS-triggered palm-print pipeline
-Python 3.6-compatible
+Jetson listener for NFS‑triggered palm‑print pipeline (ROI‑ready images)
+Python 3.6‑compatible
+
+▶ **Atomic batch enrollment** (6 ROI images → one participant)
+▶ **Incrementing participant IDs (001, 002, …) automatically)**
+▶ **CLASS_JSON maps each participant to all its column indices**
+
+**NOTE:** Logging calls have been replaced with simple `print()` statements
+per user request.
 """
-import os, re, json, time, pathlib, queue, threading, logging, collections
+
+import os, re, json, time, pathlib, queue, threading, collections
 from typing import Tuple, Dict, List
 
 import numpy as np
-import cv2
 from PIL import Image
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -16,47 +23,53 @@ import torch
 import torchvision.transforms as T
 
 # ────────── paths & constants ──────────────────────────────────────────
-IN_DIR   = pathlib.Path("/mnt/jetson_cam/in")
-OUT_DIR  = pathlib.Path("/mnt/jetson_cam/out")
+IN_DIR   = pathlib.Path("/home/nemo/server/in")
+OUT_DIR  = pathlib.Path("/home/nemo/server/out")
 DATA_DIR = pathlib.Path("data")
-ROI_DIR  = pathlib.Path("/mnt/jetson_cam/roi")
-ROI_DIR.mkdir(parents=True, exist_ok=True)
 
 FEATURE_NPY = DATA_DIR / "feature_matrix_s14_no_interpolate.npy"
 CLASS_JSON  = DATA_DIR / "feature_matrix_s14_no_interpolate.json"
 NEW_MATRIX  = DATA_DIR / "test.npy"
 
-DIM        = 384
-BATCH      = 7
-FNAME_RE   = re.compile(r"^(ENR|ID)_(\d+)_([0-6])\.jpg$", re.I)
+DIM   = 384
+BATCH = 6  # images per participant
+FNAME_RE = re.compile(r"^(ENR|ID)_(\d+)_0[0-5]\.jpg$", re.I)  # 00‑05 only
+
+# ────────── utility helpers ───────────────────────────────────────────
+
+def _safe_unlink(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+def _next_pid(cls_dict: Dict[str, List[int]]) -> str:
+    if not cls_dict:
+        return "001"
+    nums = [int(k) for k in cls_dict.keys() if k.isdigit()]
+    return f"{max(nums)+1:03d}"
 
 # ────────── DINOv2 model ──────────────────────────────────────────────
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == "cuda":
     torch.cuda.empty_cache()
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s",
-                    datefmt="%H:%M:%S")
-
-logging.info("Loading DINOv2 ViT-S/14 …")
-model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
-                       pretrained=True)
+print("Loading DINOv2 ViT‑S/14 …")
+model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
 model.eval().to(device)
 if device.type == "cuda":
     model.half()
 
 transform = T.Compose([
     T.Resize(256), T.CenterCrop(224), T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225])
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
 @torch.no_grad()
 def extract_features(img_path: str) -> np.ndarray:
-    """Return L2-normalised 384-D feature vector for one image."""
-    pil = Image.open(img_path).convert("L")        # grayscale
-    pil = Image.merge("RGB", (pil, pil, pil))      # fake 3-ch
+    pil = Image.open(img_path).convert("L")
+    pil = Image.merge("RGB", (pil, pil, pil))
     ten = transform(pil).unsqueeze(0).to(device)
     if device.type == "cuda":
         ten = ten.half()
@@ -65,74 +78,97 @@ def extract_features(img_path: str) -> np.ndarray:
     return vec.astype(np.float32)
 
 # ────────── gallery I/O ────────────────────────────────────────────────
-def load_gallery() -> Tuple[np.ndarray, Dict[str, int]]:
+
+def load_gallery() -> Tuple[np.ndarray, Dict[str, List[int]]]:
     if NEW_MATRIX.exists():
         A = np.load(NEW_MATRIX)
     elif FEATURE_NPY.exists():
         A = np.load(FEATURE_NPY)
     else:
         A = np.empty((DIM, 0), np.float32)
-    classes = json.load(CLASS_JSON.open()) if CLASS_JSON.exists() else {}
-    return A, classes
+    if CLASS_JSON.exists():
+        with CLASS_JSON.open() as f:
+            cls = json.load(f)
+    else:
+        cls = {}
+    for k, v in list(cls.items()):
+        if isinstance(v, int):
+            cls[k] = [v]
+    return A, cls
 
-def save_gallery(A: np.ndarray, classes: Dict[str, int]) -> None:
+def save_gallery(A: np.ndarray, cls: Dict[str, List[int]]) -> None:
     np.save(NEW_MATRIX, A)
     with CLASS_JSON.open("w") as f:
-        json.dump(classes, f, indent=2)
+        json.dump(cls, f, indent=2)
 
 A, class_dict = load_gallery()
-logging.info("Gallery columns (subjects): %d", A.shape[1])
+print(f"Gallery columns: {A.shape[1]} • Participants: {len(class_dict)}")
 
 # ────────── import original helpers ────────────────────────────────────
-from enroll   import run_enrollment   # expected to return (A, class_dict)
+from enroll   import run_enrollment
 from identify import run_identification
 
-# ────────── helper: warm-up DINOv2 once ────────────────────────────────
-def warm_dinov2() -> None:
+# ────────── warm‑up DINOv2 ────────────────────────────────────────────
+
+def _warm():
     with torch.no_grad():
         dummy = torch.zeros((1, 3, 224, 224), device=device)
         if device.type == "cuda":
             dummy = dummy.half()
         _ = model(dummy)
 
-warm_dinov2()
+_warm()
 
 # ────────── session state ──────────────────────────────────────────────
-enr_count: collections.Counter = collections.Counter()  # {sid: processed}
-enr_label: Dict[str, str]       = {}                    # {sid: label}
+
+enr_paths: Dict[str, List[pathlib.Path]] = collections.defaultdict(list)
+enr_count: collections.Counter = collections.Counter()
 id_votes : Dict[str, List[str]] = collections.defaultdict(list)
 
-# ────────── helper to write JSON results ───────────────────────────────
+# ────────── NEW HELPERS (put near other helpers) ──────────────────────
+def _abandon_incomplete_enroll(curr_sid: str) -> None:
+    """Drop any ENR sessions ≠ curr_sid that never reached BATCH images."""
+    for sid, paths in list(enr_paths.items()):
+        if sid == curr_sid or len(paths) >= BATCH:
+            continue
+        print(f"[ABORT] ENR {sid}: only {len(paths)}/{BATCH} images — discarding")
+        for pt in paths:
+            _safe_unlink(pt)
+        enr_paths.pop(sid, None)
+        enr_count.pop(sid, None)
+
+def _abandon_incomplete_ident(curr_sid: str) -> None:
+    """Drop any IDENTIFY sessions ≠ curr_sid that never reached BATCH votes."""
+    for sid, votes in list(id_votes.items()):
+        if sid == curr_sid or len(votes) >= BATCH:
+            continue
+        print(f"[ABORT] ID  {sid}: only {len(votes)}/{BATCH} votes — discarding")
+        id_votes.pop(sid, None)
+# ────────── write JSON helper ─────────────────────────────────────────
+
 def write_json(stem: str, payload: dict) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    tmp   = OUT_DIR / (stem + ".tmp")
-    final = OUT_DIR / (stem + ".ok.json")
+    tmp   = OUT_DIR / f"{stem}.tmp"
+    final = OUT_DIR / f"{stem}.json"
     with tmp.open("w") as f:
         json.dump(payload, f, indent=2)
     tmp.rename(final)
 
-# ────────── directory monitor (watchdog) ───────────────────────────────
+# ────────── watchdog setup ────────────────────────────────────────────
+
 work_q: queue.Queue = queue.Queue(maxsize=256)
 
 class NewFile(FileSystemEventHandler):
-    """Enqueue every .jpg that appears via atomic rename in IN_DIR."""
     def on_moved(self, event):
-        # event.dest_path is the *new* name after rename
         if not event.is_directory and event.dest_path.endswith(".jpg"):
             work_q.put(pathlib.Path(event.dest_path))
     def on_created(self, event):
-        # created events will fire if the producer writes directly,
-        # but we still only accept ready-made .jpg
-        if (not event.is_directory
-                and event.src_path.endswith(".jpg")):
+        if not event.is_directory and event.src_path.endswith(".jpg"):
             work_q.put(pathlib.Path(event.src_path))
 
-# ────────── ROI extraction helper ──────────────────────────────────────
-from google_roi import extract_palm_roi    # your landmark/ROI function
+# ────────── wait until file stable ────────────────────────────────────
 
-def wait_for_stable(path: pathlib.Path, retries: int = 20,
-                    pause: float = 0.05) -> bool:
-    """Return True when file size has stopped changing."""
+def wait_for_stable(path: pathlib.Path, retries: int = 20, pause: float = 0.05):
     prev = -1
     for _ in range(retries):
         try:
@@ -145,96 +181,85 @@ def wait_for_stable(path: pathlib.Path, retries: int = 20,
         time.sleep(pause)
     return False
 
-def roi_from_image(img_path: pathlib.Path):
-    # ensure file is fully written (if direct write, not rename)
-    wait_for_stable(img_path, retries=10, pause=0.1)
+# ────────── representative dict for ID ────────────────────────────────
 
-    img = cv2.imread(str(img_path))
-    if img is None:
-        logging.error("OpenCV failed to read %s", img_path.name)
-        return None
-
-    roi, _, _ = extract_palm_roi(img)
-    if roi is None:
-        logging.warning("Landmarks not found in %s", img_path.name)
-        return None
-
-    roi_path = ROI_DIR / (img_path.stem + "_roi.jpg")
-    cv2.imwrite(str(roi_path), roi)
-    return roi_path
+def _rep_dict(cls: Dict[str, List[int]]) -> Dict[str, List[int]]:
+    return cls
 
 # ────────── worker thread ──────────────────────────────────────────────
+
 def process_loop():
     global A, class_dict
     while True:
         p: pathlib.Path = work_q.get()
-        # ignore any stray .tmp or unrelated file
-        if p.suffix != ".jpg":
+        if p.suffix.lower() != ".jpg":
             continue
 
         m = FNAME_RE.match(p.name)
         if not m:
-            logging.warning("Ignoring bad filename %s", p.name)
-            try: p.unlink()
-            except FileNotFoundError: pass
+            print(f"[WARN] Ignoring bad filename {p.name}")
+            _safe_unlink(p)
             continue
 
-        mode, sid, idx = m.group(1).upper(), m.group(2), m.group(3)
+        mode, sid = m.group(1).upper(), m.group(2)
+        wait_for_stable(p)
 
-        try:
-            roi_path = roi_from_image(p)
-            if roi_path is None:
+        if mode == "ENR":
+            _abandon_incomplete_enroll(sid)
+            enr_paths[sid].append(p)
+            enr_count[sid] = len(enr_paths[sid])
+            print(f"Image receied: {p}")
+            print(f"→ ENR {sid}: {enr_count[sid]}/{BATCH} images buffered")
+
+            if enr_count[sid] == BATCH:
+                feats = [extract_features(str(pt)) for pt in enr_paths[sid]]
+                start = A.shape[1]
+                A = np.hstack([A, np.column_stack(feats)])
+                cols = list(range(start, start+BATCH))
+
+                pid = _next_pid(class_dict)
+                class_dict.setdefault(pid, []).extend(cols)
+
+                save_gallery(A, class_dict)
+                write_json(f"results", {
+                    "mode": "enroll",
+                    "result": pid,
+                })
+                for pt in enr_paths.pop(sid):
+                    _safe_unlink(pt)
+                enr_count.pop(sid, None)
+
+        else:  # IDENTIFY
+            _abandon_incomplete_ident(sid)
+            if A.shape[1] == 0:
+                print(f"[WARN] No participants enrolled yet — skipping identify for {p.name}")
+                _safe_unlink(p)
                 continue
+            rep_dict = _rep_dict(class_dict)              
+            
+            label = run_identification(A, rep_dict, extract_features, str(p))
+            if label:
+                id_votes[sid].append(label)
 
-            if mode == "ENR":
-                A, class_dict = run_enrollment(
-                    A, class_dict, NEW_MATRIX, extract_features, str(roi_path)
-                )
-                if sid not in enr_label:
-                    # assign label for this new subject
-                    enr_label[sid] = max(class_dict, key=class_dict.get)
-                enr_count[sid] += 1
+            # Once we have 6 votes, decide the winner
+            if len(id_votes[sid]) == BATCH:
+                votes   = collections.Counter(id_votes.pop(sid))
+                top_cnt = votes.most_common(1)[0][1]
+                winners = [lbl for lbl, c in votes.items() if c == top_cnt]
+                final   = winners[0]
+                print(f"[✓] IDENTIFY {sid}: winner → {final}  votes → {dict(votes)}")
 
-                if enr_count[sid] == BATCH:
-                    save_gallery(A, class_dict)
-                    write_json(f"ENR_{sid}", {
-                        "mode":    "enroll",
-                        "session": sid,
-                        "label":   enr_label[sid],
-                        "images":  BATCH
-                    })
-                    enr_count.pop(sid, None)
-                    enr_label.pop(sid, None)
-
-            else:  # IDENTIFY
-                label = run_identification(
-                    A, class_dict, extract_features, str(roi_path)
-                )
-                if label:
-                    id_votes[sid].append(label)
-
-                if len(id_votes[sid]) == BATCH:
-                    votes   = collections.Counter(id_votes.pop(sid))
-                    top_cnt = votes.most_common(1)[0][1]
-                    winners = [lbl for lbl, c in votes.items() if c == top_cnt]
-                    final   = winners[0]  # tie-break: first winner
-                    write_json(f"ID_{sid}", {
-                        "mode":    "identify",
-                        "session": sid,
-                        "votes":   dict(votes),
-                        "winner":  final,
-                        "count":   top_cnt
-                    })
-                    logging.info("[✓] Final result for session %s → %s",
-                                 sid, final)
-
-        finally:
-            # clean up original file if still present
-            try: p.unlink()
-            except FileNotFoundError:
-                pass
+                write_json(f"results", {
+                    "mode":    "identify",
+                    "session": sid,
+                    "votes":   dict(votes),
+                    "result":  final,
+                    "count":   top_cnt
+                })
+            _safe_unlink(p)
 
 # ────────── main ───────────────────────────────────────────────────────
+
 def main():
     IN_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -244,8 +269,7 @@ def main():
     observer.start()
 
     threading.Thread(target=process_loop, daemon=True).start()
-    logging.info("Watching %s  (batch size %d)… Ctrl-C to stop",
-                 IN_DIR, BATCH)
+    print(f"Watching {IN_DIR} (batch size {BATCH})…  Ctrl-C to stop")
 
     try:
         while True:
